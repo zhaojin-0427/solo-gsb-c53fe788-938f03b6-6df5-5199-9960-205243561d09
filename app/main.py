@@ -21,6 +21,15 @@ nothing can reach any more -- never the current revision, never a
 revision pinned by a copy-session manifest or target baseline -- either
 as a read-only preview (``dry_run``) or as one locked, re-validated,
 all-or-nothing transaction.
+
+Object path moves (``POST /moves``) atomically migrate a path: when the
+source's strong ETag AND revision number match its current revision and
+the target has no content, one transaction locks both endpoints in
+ascending path order, publishes the source content and media type as a
+new target revision and detaches the source (its GET/HEAD become 404).
+A per-path revision high-water mark keeps numbers monotonic when a
+moved-away path is later re-PUT or reused as a target, even after /gc
+has removed every leftover revision.
 """
 from __future__ import annotations
 
@@ -51,7 +60,7 @@ from .copy_sessions import (
     source_set_hash,
 )
 from .dates import http_date, parse_http_date
-from .etags import make_etag
+from .etags import make_etag, parse_etag
 from .preconditions import (
     Outcome,
     RequestConditions,
@@ -338,6 +347,160 @@ async def publish_object(path: str, request: Request):
         "X-Revision-No": str(revision_no),
     }
     return Response(status_code=204, headers=headers)
+
+
+# ---- object path moves --------------------------------------------------------
+
+
+def _move_bad_request(detail: str) -> JSONResponse:
+    return JSONResponse({"detail": detail}, status_code=400)
+
+
+@app.post("/moves")
+async def move_object(request: Request):
+    """Atomically migrate a path: ``POST /moves``.
+
+    The request pins the source by *both* its strong ETag and its
+    revision number.  When the source exists, both validators match its
+    current revision and the target currently has no content, one
+    transaction locks both endpoints in ascending path order, publishes
+    the source content and media type as a new target revision, and
+    detaches the source (GET/HEAD on it becomes 404).  Failures:
+
+    * 404 -- the source path has no current revision (missing or already
+      moved away);
+    * 412 -- the source changed: its strong ETag or revision number no
+      longer matches;
+    * 409 -- the target already has content.
+
+    On any failure the transaction rolls back, so no partial move is ever
+    visible.  Revision numbers come from the per-path high-water mark, so
+    re-PUTting a moved-away path (or reusing it as a move target) can
+    neither regress nor reuse old numbers.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return _move_bad_request("request body must be valid JSON")
+    if not isinstance(body, dict):
+        return _move_bad_request("request body must be a JSON object")
+
+    source_path = body.get("source_path")
+    target_path = body.get("target_path")
+    if not isinstance(source_path, str) or not source_path:
+        return _move_bad_request("source_path must be a non-empty string")
+    if not isinstance(target_path, str) or not target_path:
+        return _move_bad_request("target_path must be a non-empty string")
+    if source_path == target_path:
+        return _move_bad_request("source_path and target_path must differ")
+
+    source_etag_raw = body.get("source_etag")
+    if not isinstance(source_etag_raw, str) or not source_etag_raw:
+        return _move_bad_request("source_etag must be a non-empty string")
+    source_etag = parse_etag(source_etag_raw)
+    if source_etag is None or source_etag.weak:
+        # A weak validator can never prove the exact current revision:
+        # the move needs the strong identity returned by GET/PUT.
+        return _move_bad_request("source_etag must be a strong entity-tag")
+
+    source_revision_no = body.get("source_revision_no")
+    if (
+        not isinstance(source_revision_no, int)
+        or isinstance(source_revision_no, bool)
+        or source_revision_no < 1
+    ):
+        return _move_bad_request(
+            "source_revision_no must be a positive integer"
+        )
+
+    pool = request.app.state.pool
+    conn = await pool.acquire()
+    tx = conn.transaction()
+    await tx.start()
+    try:
+        try:
+            endpoints = await database.lock_move_endpoints(
+                conn, source_path, target_path
+            )
+            source = endpoints[source_path]
+            target = endpoints[target_path]
+
+            # 404 first: a detached source (moved away) is absent here.
+            if source.current_id is None:
+                await tx.rollback()
+                return JSONResponse(
+                    {"detail": "source_not_found", "source_path": source_path},
+                    status_code=404,
+                )
+
+            mismatches = []
+            if source.sha256 != source_etag.opaque:
+                mismatches.append("source_etag")
+            if source.revision_no != source_revision_no:
+                mismatches.append("source_revision_no")
+            if mismatches:
+                await tx.rollback()
+                return JSONResponse(
+                    {
+                        "detail": "precondition_failed",
+                        "source_path": source_path,
+                        "mismatches": mismatches,
+                        "current_etag": str(make_etag(source.sha256)),
+                        "current_revision_no": source.revision_no,
+                    },
+                    status_code=412,
+                    headers=validator_headers(source),
+                )
+
+            # 409 last: the target must still be empty under the lock, so
+            # a concurrent first publish cannot slip past an unlocked row.
+            if target.current_id is not None:
+                await tx.rollback()
+                return JSONResponse(
+                    {
+                        "detail": "target_already_exists",
+                        "target_path": target_path,
+                        "current_etag": str(make_etag(target.sha256)),
+                        "current_revision_no": target.revision_no,
+                    },
+                    status_code=409,
+                )
+
+            # Re-publish the source's exact bytes and media type as a NEW
+            # target revision (fresh revision id and per-target number),
+            # then detach the source -- one transaction, no partial state.
+            content = await database.fetch_revision_content(
+                conn, source.current_id
+            )
+            digest, target_revision_no, created_at = (
+                await database.publish_revision(
+                    conn, target_path, content, source.media_type
+                )
+            )
+            await database.detach_object(conn, source_path)
+            await tx.commit()
+        except Exception:
+            await tx.rollback()
+            raise
+    finally:
+        await pool.release(conn)
+
+    return JSONResponse(
+        {
+            "source_path": source_path,
+            "target_path": target_path,
+            "target_etag": str(make_etag(digest)),
+            "target_revision_no": target_revision_no,
+            "source_etag": str(make_etag(digest)),
+            "source_revision_no": source_revision_no,
+        },
+        status_code=201,
+        headers={
+            "ETag": str(make_etag(digest)),
+            "Last-Modified": http_date(created_at),
+            "X-Revision-No": str(target_revision_no),
+        },
+    )
 
 
 # ---- resumable copy sessions -------------------------------------------------
@@ -951,9 +1114,7 @@ async def gc_revisions(request: Request):
             ):
                 # One snapshot for the existence check and the
                 # classification, so the preview is self-consistent.
-                existing = await database.paths_with_current_revision(
-                    conn, paths
-                )
+                existing = await database.paths_existing(conn, paths)
                 missing = [p for p in paths if p not in existing]
                 if missing:
                     return _gc_not_found(missing)
@@ -970,10 +1131,18 @@ async def gc_revisions(request: Request):
             # in the same transaction -- any failure rolls the whole
             # batch back, leaving no partial collection behind.
             locked = await database.lock_existing_objects(conn, paths)
+            # Live objects and moved-away paths (revision_seq > 0, even
+            # after every historical revision was collected) count; only a
+            # bare current_id-NULL placeholder left by session creation is
+            # reported as missing, exactly like the preview path.
             missing = [
                 p
                 for p in paths
-                if p not in locked or locked[p]["current_id"] is None
+                if p not in locked
+                or (
+                    locked[p]["current_id"] is None
+                    and locked[p]["revision_seq"] == 0
+                )
             ]
             if missing:
                 return _gc_not_found(missing)

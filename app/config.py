@@ -17,8 +17,19 @@ GC_MAX_PATHS = int(os.environ.get("ORIGIN_GC_MAX_PATHS", "100"))
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS objects (
     path       text PRIMARY KEY,
-    current_id bigint
+    current_id bigint,
+    -- Per-path revision high-water mark.  A path migration (POST /moves)
+    -- detaches the source row (current_id := NULL) while leaving its old
+    -- revisions in place; once /gc collects those rows max(revision_no)
+    -- can no longer anchor numbering, so every publisher numbers new
+    -- revisions GREATEST(max(revision_no), revision_seq) + 1.  Revision
+    -- numbers therefore never regress and are never reused, even after a
+    -- move-away followed by a full historical collection.
+    revision_seq bigint NOT NULL DEFAULT 0
 );
+
+-- Databases created before path moves lack the high-water mark column.
+ALTER TABLE objects ADD COLUMN IF NOT EXISTS revision_seq bigint NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS revisions (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -124,4 +135,17 @@ CREATE TABLE IF NOT EXISTS copy_session_acks (
                            DEFAULT date_trunc('second', now()),
     PRIMARY KEY (session_id, segment_no)
 );
+
+-- Backfill the per-path revision high-water mark on databases created
+-- before path moves (runs here, once the ``revisions`` table exists).
+UPDATE objects o
+   SET revision_seq = GREATEST(
+       revision_seq,
+       COALESCE((SELECT max(r.revision_no)
+                  FROM revisions r
+                 WHERE r.object_path = o.path), 0)
+   )
+ WHERE revision_seq < COALESCE((SELECT max(r.revision_no)
+                                 FROM revisions r
+                                WHERE r.object_path = o.path), 0);
 """

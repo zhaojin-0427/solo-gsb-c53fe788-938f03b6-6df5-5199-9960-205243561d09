@@ -41,6 +41,13 @@ object's current revision and no copy-session manifest entry or target
 baseline references it, so a concurrent PUT, session creation,
 acknowledgement or streaming GET can never lose a revision it is using
 nor be left with a dangling reference.
+
+Path moves (``POST /moves``) publish the source's current revision as a
+new revision of the target path and detach the source row (its readers
+get 404), all in one transaction that locks both endpoints in ascending
+path order.  The per-path ``revision_seq`` high-water mark keeps
+revision numbers monotonic after a move-away even when /gc later removes
+every leftover revision row.
 """
 from __future__ import annotations
 
@@ -203,8 +210,19 @@ async def publish_revision(
     the objects row (see lock_new_or_existing_object).
     """
     digest = hashlib.sha256(content).hexdigest()
+    # Number from the per-path high-water mark rather than max(revision_no)
+    # alone: a move-away leaves the object row detached (current_id NULL),
+    # and /gc may later delete every leftover revision, after which
+    # max(revision_no) would be NULL and numbers would restart at 1.
     revision_no = await conn.fetchval(
-        "SELECT COALESCE(max(revision_no), 0) + 1 FROM revisions WHERE object_path = $1",
+        """
+        SELECT GREATEST(
+                   revision_seq,
+                   COALESCE((SELECT max(revision_no) FROM revisions
+                              WHERE object_path = $1), 0)
+               ) + 1
+          FROM objects WHERE path = $1
+        """,
         path,
     )
     new_id = await conn.fetchval(
@@ -220,12 +238,100 @@ async def publish_revision(
         media_type,
     )
     await conn.execute(
-        "UPDATE objects SET current_id = $2 WHERE path = $1", path, new_id
+        "UPDATE objects SET current_id = $2, revision_seq = $3 WHERE path = $1",
+        path,
+        new_id,
+        revision_no,
     )
     created_at = await conn.fetchval(
         "SELECT created_at FROM revisions WHERE id = $1", new_id
     )
     return digest, revision_no, created_at
+
+
+# ---- path moves --------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class MoveEndpoint:
+    """State of one move endpoint read while its object row is locked."""
+
+    path: str
+    exists: bool
+    current_id: int | None
+    revision_no: int | None
+    sha256: str | None
+    media_type: str | None
+    length: int | None
+    revision_seq: int
+    created_at: datetime | None
+
+
+async def lock_move_endpoints(
+    conn: asyncpg.Connection, source_path: str, target_path: str
+) -> dict[str, MoveEndpoint]:
+    """Lock both move endpoints ``FOR UPDATE`` in ascending path order.
+
+    Placeholder rows are inserted for both paths first (also in ascending
+    order), so every endpoint has a real row to lock -- the move can make
+    an absent path into its target and can race a concurrent first PUT on
+    either path.  All locks are taken in one globally ascending-path
+    statement, the same order publishers, session creation and
+    acknowledgements use, so concurrent moves can never deadlock against
+    them (two moves exchanging endpoints both try the same order; the
+    second waits on the first row it needs and then re-reads fresh state).
+
+    Only after both rows are locked are their current revisions joined:
+    the read cannot go stale before the move is decided.
+    """
+    for p in sorted({source_path, target_path}):
+        await conn.execute(
+            "INSERT INTO objects (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
+            p,
+        )
+    rows = await conn.fetch(
+        """
+        SELECT o.path,
+               (o.current_id IS NOT NULL) AS exists,
+               o.current_id,
+               r.revision_no, r.sha256, r.media_type,
+               octet_length(r.content) AS length, o.revision_seq,
+               r.created_at
+          FROM objects o
+          LEFT JOIN revisions r ON r.id = o.current_id
+         WHERE o.path = ANY($1::text[])
+         ORDER BY o.path ASC
+         FOR UPDATE OF o
+        """,
+        [source_path, target_path],
+    )
+    return {
+        r["path"]: MoveEndpoint(
+            path=r["path"],
+            exists=r["exists"],
+            current_id=r["current_id"],
+            revision_no=r["revision_no"],
+            sha256=r["sha256"],
+            media_type=r["media_type"],
+            length=r["length"],
+            revision_seq=r["revision_seq"],
+            created_at=r["created_at"],
+        )
+        for r in rows
+    }
+
+
+async def detach_object(conn: asyncpg.Connection, path: str) -> None:
+    """Drop the current pointer of a moved-away path (one UPDATE).
+
+    The revision rows stay behind -- they are immutable history that may
+    be pinned by a copy-session manifest, and they anchor numbering until
+    /gc collects them; ``revision_seq`` keeps the high-water mark either
+    way.  Readers see the path as 404 immediately after commit.
+    """
+    await conn.execute(
+        "UPDATE objects SET current_id = NULL WHERE path = $1", path
+    )
 
 
 # ---- copy sessions -----------------------------------------------------------
@@ -861,7 +967,7 @@ async def lock_existing_objects(
     """
     rows = await conn.fetch(
         """
-        SELECT o.path, o.current_id
+        SELECT o.path, o.current_id, o.revision_seq
           FROM objects o
          WHERE o.path = ANY($1::text[])
          ORDER BY o.path ASC
@@ -872,20 +978,29 @@ async def lock_existing_objects(
     return {r["path"]: r for r in rows}
 
 
-async def paths_with_current_revision(
-    conn: asyncpg.Connection, paths: list[str]
-) -> set[str]:
-    """Subset of ``paths`` that exist and have a current revision.
+async def paths_existing(conn: asyncpg.Connection, paths: list[str]) -> set[str]:
+    """Subset of ``paths`` that currently exist for reclamation.
 
-    A bare placeholder row (``current_id`` NULL) does not count: such a
-    path is a 404 for readers, so it is a 404 for reclamation too.
+    Two kinds of object rows count as existing:
+
+    * paths with a current revision (ordinary live objects), and
+    * paths with revisions but no current revision -- a moved-away path,
+      whose detached row keeps its revision history until collection.
+
+    A bare placeholder row (``current_id`` NULL and ``revision_seq`` = 0,
+    left by copy-session creation for a target that never existed) does
+    not count: such a path is a 404 for readers, so it is a 404 for
+    reclamation too.  A moved-away path keeps ``revision_seq > 0`` even
+    after every historical revision has been collected, so it remains a
+    valid GC target that simply reports empty lists on repeat -- exactly
+    like collecting a live object that has no history left.
     """
     rows = await conn.fetch(
         """
         SELECT o.path
           FROM objects o
          WHERE o.path = ANY($1::text[])
-           AND o.current_id IS NOT NULL
+           AND (o.current_id IS NOT NULL OR o.revision_seq > 0)
         """,
         paths,
     )
