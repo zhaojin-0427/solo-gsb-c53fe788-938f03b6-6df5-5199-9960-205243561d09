@@ -201,10 +201,23 @@ async def publish_revision(
     computed in Python so it is available for the response ETag without a
     second round trip.  Callers must already hold the FOR UPDATE lock on
     the objects row (see lock_new_or_existing_object).
+
+    The revision number is allocated from the object's persistent
+    ``revision_seq`` high-water mark, NOT ``max(revision_no) + 1``: after a
+    path move (``current_id`` set to NULL) or a GC run that deletes the
+    remaining historical revisions that expression could hand out a
+    smaller -- or already-used -- number.  ``revision_seq`` only ever
+    increases, so numbers are strictly per-path increasing no matter what
+    moves or collections happened in between.
     """
     digest = hashlib.sha256(content).hexdigest()
     revision_no = await conn.fetchval(
-        "SELECT COALESCE(max(revision_no), 0) + 1 FROM revisions WHERE object_path = $1",
+        """
+        UPDATE objects
+           SET revision_seq = revision_seq + 1
+         WHERE path = $1
+        RETURNING revision_seq
+        """,
         path,
     )
     new_id = await conn.fetchval(
@@ -226,6 +239,133 @@ async def publish_revision(
         "SELECT created_at FROM revisions WHERE id = $1", new_id
     )
     return digest, revision_no, created_at
+
+
+# ---- object path moves --------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class MoveOutcome:
+    """Result of an attempted move inside the caller's transaction.
+
+    ``status`` is one of ``moved`` / ``source_not_found`` /
+    ``source_precondition_failed`` / ``target_exists``.  On ``moved`` the
+    target revision identity, its media type and creation time are
+    included so the response can carry the new ETag.
+    """
+
+    status: str
+    target_revision_no: int | None = None
+    sha256: str | None = None
+    media_type: str | None = None
+    created_at: datetime | None = None
+    actual_revision_no: int | None = None
+
+
+async def move_object(
+    conn: asyncpg.Connection,
+    source_path: str,
+    target_path: str,
+    expected_sha256: str | None,
+    expected_revision_no: int,
+) -> MoveOutcome:
+    """Move the current revision of ``source_path`` onto ``target_path``.
+
+    Runs entirely inside the caller's transaction.  The steps, and their
+    order, mirror the rules every other writer follows:
+
+    1. Ensure an object row exists for both paths (a placeholder is
+       inserted for a target that never existed) and lock BOTH rows
+       ``FOR UPDATE`` in one ascending-path statement -- the same global
+       lock order publishers, session creation and acknowledgements use,
+       so two concurrent moves (or a move against a PUT) serialise
+       without deadlocks.
+    2. Only after both locks are held, read the current revision of
+       either path with a LEFT JOIN (an absent current revision comes
+       back as NULL, both for a moved-away source and an empty target
+       placeholder).  The checks below therefore run on one frozen
+       boundary; nothing a concurrent transaction commits can sneak in
+       between them.
+    3. The source must currently exist, must carry exactly the pinned
+       revision number, and its current revision must have the expected
+       SHA-256 (the strong-ETag match enforced by the caller); the target
+       must have no current content.
+    4. Publish the source's content and media type as the target's next
+       revision (numbered from the target's own ``revision_seq``
+       high-water mark, so the number never regresses or is reused), then
+       detach the source path (``current_id = NULL``).  Historical
+       revisions stay attached to the source path, so a copy session
+       created before the move keeps pulling its pinned revisions, and GC
+       can later reclaim the unreferenced ones.
+
+    Any failing step leaves the transaction rollback-only from the
+    caller's point of view (nothing has been written to revisions before
+    the checks run), so a failed move never takes partial effect.
+    """
+    # Step 1: placeholder rows first (the source usually exists; the
+    # target may never have had an object row), then one ordered lock.
+    await conn.executemany(
+        "INSERT INTO objects (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
+        [(source_path,), (target_path,)],
+    )
+    rows = await conn.fetch(
+        """
+        SELECT o.path, r.id AS revision_id, r.revision_no, r.sha256,
+               r.media_type
+          FROM objects o
+          LEFT JOIN revisions r ON r.id = o.current_id
+         WHERE o.path = ANY($1::text[])
+         ORDER BY o.path ASC
+         FOR UPDATE OF o
+        """,
+        [source_path, target_path],
+    )
+    locked = {r["path"]: r for r in rows}
+    source = locked[source_path]
+    target = locked[target_path]
+
+    # Step 3a: a moved-away (or never-published) source row reads NULL.
+    if source["revision_id"] is None:
+        return MoveOutcome(status="source_not_found")
+
+    # Step 3b: the pinned revision number AND the strong ETag must both
+    # match the revision currently addressed by the source path.  A weak
+    # request validator is passed in as ``expected_sha256 is None``: it
+    # can never satisfy a strong match, so the check always fails.
+    if (
+        source["revision_no"] != expected_revision_no
+        or expected_sha256 is None
+        or source["sha256"] != expected_sha256
+    ):
+        return MoveOutcome(
+            status="source_precondition_failed",
+            actual_revision_no=source["revision_no"],
+        )
+
+    # Step 3c: the target path must be empty -- an existing current
+    # revision is a 409 conflict, never an overwrite.
+    if target["revision_id"] is not None:
+        return MoveOutcome(status="target_exists")
+
+    # Step 4: same content, same media type, brand-new revision on the
+    # target path (its own numbering sequence).
+    content = await fetch_revision_content(conn, source["revision_id"])
+    digest, revision_no, created_at = await publish_revision(
+        conn, target_path, content, source["media_type"]
+    )
+    # Detach the source path: its GET/HEAD now resolve to 404, while the
+    # historical revisions remain on disk (and in manifest/baseline
+    # references) until GC reclaims them.
+    await conn.execute(
+        "UPDATE objects SET current_id = NULL WHERE path = $1", source_path
+    )
+    return MoveOutcome(
+        status="moved",
+        target_revision_no=revision_no,
+        sha256=digest,
+        media_type=source["media_type"],
+        created_at=created_at,
+    )
 
 
 # ---- copy sessions -----------------------------------------------------------
@@ -886,6 +1026,29 @@ async def paths_with_current_revision(
           FROM objects o
          WHERE o.path = ANY($1::text[])
            AND o.current_id IS NOT NULL
+        """,
+        paths,
+    )
+    return {r["path"] for r in rows}
+
+
+async def paths_with_any_revision(
+    conn: asyncpg.Connection, paths: list[str]
+) -> set[str]:
+    """Subset of ``paths`` that still own at least one revision row.
+
+    Unlike :func:`paths_with_current_revision` this includes a path that
+    has been *moved away*: its ``current_id`` is NULL (GET/HEAD 404) but
+    its historical revisions are still there -- GC is precisely how they
+    get reclaimed once no copy-session manifest or baseline references
+    them.  A row with no revisions at all (a placeholder left by session
+    creation, or an empty path) is still considered missing.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT DISTINCT r.object_path AS path
+          FROM revisions r
+         WHERE r.object_path = ANY($1::text[])
         """,
         paths,
     )

@@ -16,9 +16,23 @@ GC_MAX_PATHS = int(os.environ.get("ORIGIN_GC_MAX_PATHS", "100"))
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS objects (
-    path       text PRIMARY KEY,
-    current_id bigint
+    path         text PRIMARY KEY,
+    current_id   bigint,
+    -- Per-path high-water mark of ever-allocated revision numbers.  A
+    -- move sets current_id to NULL without deleting revisions, and GC may
+    -- delete every surviving revision of such a path, so the next
+    -- revision number MUST NOT be derived from max(revision_no) at insert
+    -- time (that could reuse or regress numbers); it comes from this
+    -- monotonically increasing counter instead.
+    revision_seq bigint NOT NULL DEFAULT 0
 );
+
+-- Upgrade for databases created before revision_seq existed.
+ALTER TABLE objects ADD COLUMN IF NOT EXISTS revision_seq
+    bigint NOT NULL DEFAULT 0;
+-- The counter is seeded from the highest historical revision number at
+-- the END of this script (the revisions table must exist first); see the
+-- backfill UPDATE below.
 
 CREATE TABLE IF NOT EXISTS revisions (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -124,4 +138,18 @@ CREATE TABLE IF NOT EXISTS copy_session_acks (
                            DEFAULT date_trunc('second', now()),
     PRIMARY KEY (session_id, segment_no)
 );
+
+-- Backfill the per-path revision counter for databases created before
+-- revision_seq existed: seed from the highest historical revision number
+-- so numbering keeps strictly increasing after the upgrade as well.
+-- Runs after every table above has been created so a fresh database
+-- initialises without an undefined-table error.
+UPDATE objects o
+   SET revision_seq = sub.m
+  FROM (
+        SELECT object_path, max(revision_no) AS m
+          FROM revisions
+         GROUP BY object_path
+       ) AS sub
+ WHERE o.path = sub.object_path AND o.revision_seq = 0;
 """
